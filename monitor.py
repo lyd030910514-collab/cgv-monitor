@@ -1,15 +1,21 @@
 """
-CGV 예매 오픈 감시 봇 v3 — 2개 서버 동시 감시 + 차단 시 즉시 갈아타기
+CGV 예매 오픈 감시 봇 v4 — 매 확인마다 디스코드에 무조건 메시지가 오는 버전
 
-- GitHub에서 서버 A, B 두 개가 동시에 감시합니다. 서버(IP)가 서로 달라서 둘이 한꺼번에 막힐 확률이 낮아요.
-- 확인 시각을 엇갈리게 맞춥니다. A는 0초, B는 간격의 절반(180초 기준 90초)이라 실질 확인 간격이 약 90초가 됩니다.
-- 접속 제한(403 등)을 만나면 재시도나 대기 없이 바로 종료합니다. 워크플로가 새 서버(새 IP)로 다시 시작해요.
-- (v2 유지) 날짜 줄 스크린샷, 정상 작동 알림, 단계별 자가 복구, 실패 순간의 화면 전송
+- 확인할 때마다(기본 3분) 성공이든 차단이든 오류든 디스코드에 메시지가 옵니다.
+- 로그가 바로바로 Actions 화면에 찍힙니다 (이전엔 로그가 통째로 비어 보이는 문제가 있었어요).
+- 웹훅이 죽었으면 시작하자마자 로그에 크게 표시하고, 시작 중에 죽으면 💥 메시지를 보냅니다.
+- (v3 유지) 서버 A/B 동시 감시, 차단 시 즉시 갈아타기, 프록시 전환, 날짜 줄 스크린샷
 """
 import os, re, sys, json, time, datetime as dt
 from urllib.parse import urlparse, unquote
 import requests
 from playwright.sync_api import sync_playwright
+
+try:   # 출력을 줄 단위로 바로 내보냄 (Actions 로그가 비어 보이지 않도록)
+    sys.stdout.reconfigure(line_buffering=True)
+    sys.stderr.reconfigure(line_buffering=True)
+except Exception:
+    pass
 
 # ───────── 설정 (환경변수로 바꿀 수 있음) ─────────
 WEBHOOK = (os.getenv("DISCORD_WEBHOOK_URL") or "https://discord.com/api/webhooks/1562771316803903560/2ra2oMnp9HWoyRodHR_C1mL4KvhK5vFRYuRfNpg1yjQ4nRU7WtoB2m5vYNme8dhAo7pR").strip()   # Secret이 있으면 그걸 우선 사용
@@ -26,10 +32,10 @@ SLOT_OFFSET = {"b": INTERVAL // 2, "pc": INTERVAL // 4}.get(WORKER, 0)   # B는 
 SEND_START = os.getenv("SEND_START_MESSAGE", "false") == "true"
 HEARTBEAT_EVERY = int(os.getenv("HEARTBEAT_EVERY", "10"))  # 연속 N번 성공마다 정상 알림. 0이면 끔
 GAP_ALERT_MIN = int(os.getenv("GAP_ALERT_MIN", "60"))      # 이 시간 넘게 확인 못 하면 알림
-ERR_NOTICE_MIN = int(os.getenv("ERR_NOTICE_MIN", "60"))    # 문제(🚫/⚠️) 알림 최소 간격(분). 차단이 계속될 때 도배 방지
+ERR_NOTICE_MIN = int(os.getenv("ERR_NOTICE_MIN", "0"))     # 문제(🚫/⚠️) 알림 최소 간격(분). 0 = 확인할 때마다 매번 알림
 MAX_BLOCKED = int(os.getenv("MAX_BLOCKED", "1"))           # GitHub에서 연속 N번 차단되면 종료 → 새 서버로 재시작 (1 = 즉시)
 BLOCK_BACKOFF = int(os.getenv("BLOCK_BACKOFF_SEC", "30"))  # 차단→재시작이 연속될 때만 늘어나는 대기(초). 첫 차단은 대기 없음
-SHOT_MODE = os.getenv("SHOT_MODE", "edit")                 # edit: 한 메시지를 계속 수정 / each: 매번 새 메시지 / change: 상태 바뀔 때만 / off: 안 보냄
+SHOT_MODE = os.getenv("SHOT_MODE", "each")                 # each: 확인마다 새 메시지(기본) / edit: 한 메시지를 계속 수정 / change: 상태 바뀔 때만 / off: 안 보냄
 MENTION = os.getenv("MENTION", "")                         # 예매 오픈 알림에 붙일 멘션. 예: "@everyone"
 LIGHT_MODE = os.getenv("LIGHT_MODE", "true") == "true"     # 이미지/폰트/추적 스크립트 안 받아서 빠르게
 ON_GITHUB = os.getenv("GITHUB_ACTIONS") == "true"
@@ -109,9 +115,16 @@ def stamp(msg):
     return f"{TAG}{dt.datetime.now(KST).strftime('%H:%M:%S')} {msg}"
 
 
+def _log_fail(what, r):
+    """디스코드가 거절하면 로그에 이유를 남긴다 (이전엔 조용히 사라져서 원인을 알 수 없었음)"""
+    if r is not None and not r.ok:
+        print(f"⚠️ 디스코드 {what} 실패: HTTP {r.status_code} {r.text[:150]}")
+
+
 def notify(msg):
     try:
-        requests.post(WEBHOOK, json={"content": stamp(msg)[:1900]}, timeout=15)
+        r = requests.post(WEBHOOK, json={"content": stamp(msg)[:1900]}, timeout=15)
+        _log_fail("전송", r)
     except Exception as e:
         print("discord error:", e)
 
@@ -121,6 +134,7 @@ def post_with_image(msg, img, name="shot.jpg"):
     try:
         r = requests.post(WEBHOOK, params={"wait": "true"}, data={"content": stamp(msg)[:1900]},
                           files={"file": (name, img, "image/jpeg")}, timeout=30)
+        _log_fail("이미지 전송", r)
         return r.json().get("id") if r.ok else None
     except Exception as e:
         print("discord image error:", e)
@@ -138,6 +152,7 @@ def edit_with_image(msg, img):
                 files={"files[0]": ("shot.jpg", img, "image/jpeg")}, timeout=30)
             if r.ok:
                 return
+            _log_fail("메시지 수정", r)
         except Exception as e:
             print("discord edit error:", e)
     new = post_with_image(msg, img)
@@ -146,7 +161,11 @@ def edit_with_image(msg, img):
 
 
 def send_shot(msg, img):
-    if SHOT_MODE == "off" or not img:
+    """성공한 확인의 상태 메시지. 이미지를 못 찍었어도 글자 메시지는 보낸다"""
+    if SHOT_MODE == "off":
+        return
+    if not img:
+        notify(msg + "\n(스크린샷을 찍지 못했어요)")
         return
     if SHOT_MODE == "each":
         post_with_image(msg, img)
@@ -154,6 +173,24 @@ def send_shot(msg, img):
         pass  # 상태가 바뀐 경우는 on_success에서 처리
     else:
         edit_with_image(msg, img)
+
+
+def check_webhook():
+    """시작할 때 웹훅이 살아 있는지 확인. 삭제됐거나 주소가 틀리면 False"""
+    try:
+        r = requests.get(WEBHOOK, timeout=10)
+        name = ""
+        try:
+            name = r.json().get("name", "")   # 주소(토큰)는 로그에 찍지 않음
+        except Exception:
+            pass
+        print(f"웹훅 확인: HTTP {r.status_code} {name}")
+        if r.status_code in (401, 404):
+            print("❌ 웹훅이 없어졌거나 주소가 틀려요. 디스코드에서 새 웹훅을 만들어 GitHub Secret(DISCORD_WEBHOOK_URL)에 넣어 주세요.")
+            return False
+    except Exception as e:
+        print("웹훅 확인 중 오류(무시하고 계속):", e)
+    return True
 
 
 # ───────── 날짜 줄 읽기 (활성/비활성 판단) ─────────
@@ -481,10 +518,10 @@ def one_check(browser, holder):
 
 # ───────── 알림 로직 ─────────
 def alert_problem(kind, detail, holder):
-    """문제 알림 (ERR_NOTICE_MIN분에 한 번) + 그 순간 화면"""
+    """문제 알림 + 그 순간 화면. 기본(ERR_NOTICE_MIN=0)은 확인할 때마다 매번 보낸다"""
     now = time.time()
     set_state(problem=True)
-    if now - STATE.get("last_err_notice", 0) < ERR_NOTICE_MIN * 60:
+    if ERR_NOTICE_MIN > 0 and now - STATE.get("last_err_notice", 0) < ERR_NOTICE_MIN * 60:
         return
     set_state(last_err_notice=now)
     msg = f"{kind} (단계: {holder.get('fail_stage') or STAGE})\n{detail[:300]}"
@@ -532,14 +569,14 @@ def on_success(enabled, status, img, streak):
         changed = {d.isoformat() for d in enabled} != set(STATE.get("enabled", []))
     set_state(enabled=sorted(d.isoformat() for d in enabled))
 
-    # 날짜 화면 스크린샷
+    # 날짜 화면 스크린샷 (확인할 때마다)
     near = [d for d in enabled if d >= CUTOFF]
     caption = (f"📅 날짜 상태: {status}\n{CUTOFF} 이후 열림: "
                + (", ".join(d.strftime("%m/%d") for d in near) if near else "없음")
                + f" | 연속 {streak}회 정상")
     if SHOT_MODE == "change":
         if changed or "shot_sent" not in STATE:
-            post_with_image(caption, img)
+            post_with_image(caption, img) if img else notify(caption)
             set_state(shot_sent=True)
     else:
         send_shot(caption, img)
@@ -570,8 +607,14 @@ def sleep_until_slot():
 
 
 def main():
+    print(f"CGV 감시 시작 — 서버 {WORKER.upper() or '단독'}, 간격 {INTERVAL}초, 모드 {SHOT_MODE}, "
+          f"GitHub={ON_GITHUB}, 브라우저={os.getenv('BROWSER_CHANNEL') or '기본'}")
     if not WEBHOOK:
         print("DISCORD_WEBHOOK_URL 환경변수(GitHub Secret)가 없습니다. 디스코드 웹훅 주소를 등록해 주세요.")
+        sys.exit(1)
+    if not check_webhook():
+        if ON_GITHUB:
+            time.sleep(300)   # 웹훅이 죽은 채로 재시작이 계속 반복되며 시간을 쓰지 않도록
         sys.exit(1)
     if SEND_START:
         notify(f"✅ CGV 모니터링 시작: '{KEYWORD}' / {THEATER} / {CUTOFF} 이후 날짜 감시 "
@@ -584,6 +627,7 @@ def main():
         holder = {"pw": p, "proxy_on": False}
         holder["browser"] = launch_browser(p)
         reset_browser(holder["browser"], holder)
+        print("브라우저 준비 완료 — 첫 확인을 시작합니다")
         while time.time() < end and not give_up:
             t0, pause = time.time(), None
             holder["fail_shot"] = None
@@ -634,4 +678,14 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except SystemExit:
+        raise
+    except Exception as e:
+        # 시작 중에 죽어도 조용히 사라지지 않도록 디스코드에 알리고, 재시작이 쉴 새 없이 반복되지 않게 잠깐 쉰다
+        print("💥 치명적 오류:", repr(e))
+        notify(f"💥 봇이 중간에 멈췄어요: {str(e)[:300]}")
+        if ON_GITHUB:
+            time.sleep(60)
+        raise
