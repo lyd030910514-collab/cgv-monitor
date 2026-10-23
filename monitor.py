@@ -6,7 +6,7 @@ CGV 예매 오픈 감시 봇 v4 — 매 확인마다 디스코드에 무조건 �
 - 웹훅이 죽었으면 시작하자마자 로그에 크게 표시하고, 시작 중에 죽으면 💥 메시지를 보냅니다.
 - (v3 유지) 서버 A/B 동시 감시, 차단 시 즉시 갈아타기, 프록시 전환, 날짜 줄 스크린샷
 """
-import os, re, sys, json, time, datetime as dt
+import os, re, sys, json, time, random, datetime as dt
 from urllib.parse import urlparse, unquote
 import requests
 from playwright.sync_api import sync_playwright
@@ -37,6 +37,7 @@ MAX_BLOCKED = int(os.getenv("MAX_BLOCKED", "1"))           # GitHub에서 연속
 BLOCK_BACKOFF = int(os.getenv("BLOCK_BACKOFF_SEC", "30"))  # 차단→재시작이 연속될 때만 늘어나는 대기(초). 첫 차단은 대기 없음
 SHOT_MODE = os.getenv("SHOT_MODE", "each")                 # each: 확인마다 새 메시지(기본) / edit: 한 메시지를 계속 수정 / change: 상태 바뀔 때만 / off: 안 보냄
 MENTION = os.getenv("MENTION", "")                         # 예매 오픈 알림에 붙일 멘션. 예: "@everyone"
+HUMAN_ENTRY = os.getenv("HUMAN_ENTRY", "true") == "true"   # 메인 페이지를 먼저 열고 검색 화면으로 가기 (사람처럼). false면 검색 주소로 직행
 LIGHT_MODE = os.getenv("LIGHT_MODE", "true") == "true"     # 이미지/폰트/추적 스크립트 안 받아서 빠르게
 ON_GITHUB = os.getenv("GITHUB_ACTIONS") == "true"
 PROXY_URL = (os.getenv("PROXY_URL") or "").strip()         # 예: http://아이디:비번@주소:포트 (한국 IP 프록시). 비어 있으면 프록시를 쓰지 않음
@@ -339,12 +340,52 @@ def snap(page, **kw):
 
 
 # ───────── 예매 화면 열기 ─────────
+def enter_search_like_human(page):
+    """사람처럼: 메인 페이지 → 잠깐 머무름 → 검색 화면으로 이동.
+    단계 이름이 달라서, 어디서 막히는지(메인부터 막힘 / 검색에서만 막힘) 메시지만 봐도 알 수 있다."""
+    stage("메인 페이지 접속")
+    resp = page.goto(BASE, wait_until="domcontentloaded", timeout=45000)
+    if resp is not None and resp.status in (403, 429):
+        raise Blocked(f"메인 페이지부터 HTTP {resp.status}")
+    page.wait_for_timeout(1000)   # 화면이 그려질 시간 (아직 비어 있어도 빈 화면으로 오해하지 않도록 차단 문구만 확인)
+    if BLOCK_RE.search(body_text(page)):
+        raise Blocked(f"메인 페이지 접속 제한: {body_text(page)[:80]}")
+
+    stage("메인 페이지 둘러보기")
+    try:
+        page.mouse.move(400 + random.randint(0, 300), 250 + random.randint(0, 200), steps=8)
+        page.wait_for_timeout(random.randint(1500, 3000))
+        page.mouse.wheel(0, random.randint(150, 400))
+        page.wait_for_timeout(random.randint(500, 1200))
+    except Exception:
+        pass
+
+    stage("검색 화면으로 이동")
+    # 1) 메인 화면의 검색 링크/버튼을 눌러 이동
+    for make in (lambda: page.locator("a[href*='itgrSrch']").first,
+                 lambda: page.get_by_role("link", name=re.compile("검색")).first,
+                 lambda: page.get_by_role("button", name=re.compile("검색")).first):
+        try:
+            make().click(timeout=4000)
+            page.wait_for_url(re.compile(r"itgrSrch|search", re.I), timeout=8000)
+            return
+        except Exception:
+            continue
+    # 2) 못 찾으면 주소로 이동하되, 메인에서 온 것처럼 이전 페이지(referer)를 알려줌
+    resp = page.goto(f"{BASE}/tme/itgrSrch", wait_until="domcontentloaded", timeout=45000, referer=BASE)
+    if resp is not None and resp.status in (403, 429):
+        raise Blocked(f"검색 페이지에서 HTTP {resp.status} (메인은 통과)")
+
+
 def open_via_search(page):
     """처음부터: 통합검색 → 작품 → 예매하기 (느리지만 확실한 경로)"""
-    stage("검색 페이지 접속")
-    resp = page.goto(f"{BASE}/tme/itgrSrch", wait_until="domcontentloaded", timeout=45000)
-    if resp is not None and resp.status in (403, 429):
-        raise Blocked(f"HTTP {resp.status}")
+    if HUMAN_ENTRY:
+        enter_search_like_human(page)
+    else:
+        stage("검색 페이지 접속")
+        resp = page.goto(f"{BASE}/tme/itgrSrch", wait_until="domcontentloaded", timeout=45000)
+        if resp is not None and resp.status in (403, 429):
+            raise Blocked(f"HTTP {resp.status}")
     box = page.locator("input[placeholder*='검색어'], input[type=search]").first
     try:
         box.wait_for(timeout=20000)
