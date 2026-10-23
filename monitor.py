@@ -535,7 +535,9 @@ def main():
     blocked_streak, streak, give_up = 0, 0, False
     end = time.time() + LOOP_MINUTES * 60
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True, args=["--disable-gpu", "--no-sandbox", "--disable-dev-shm-usage"])
+        channel = os.getenv("BROWSER_CHANNEL") or None   # "chrome" = 러너에 깔린 Chrome 사용 (브라우저 설치 생략)
+        browser = p.chromium.launch(channel=channel, headless=True,
+                                    args=["--disable-gpu", "--no-sandbox", "--disable-dev-shm-usage"])
         holder = {}
         reset_browser(browser, holder)
         while time.time() < end and not give_up:
