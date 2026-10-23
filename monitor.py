@@ -6,8 +6,10 @@ CGV 예매 오픈 감시 봇 v4 — 매 확인마다 디스코드에 무조건 �
 - 웹훅이 죽었으면 시작하자마자 로그에 크게 표시하고, 시작 중에 죽으면 💥 메시지를 보냅니다.
 - (v3 유지) 서버 동시 감시, 차단 시 즉시 갈아타기, 프록시 전환, 날짜 줄 스크린샷
 - (v5) 서버 A·B·C는 직접 접속, 서버 D는 무료 한국 프록시 목록에서 CGV가 열리는 것을 찾아 그걸로 접속 (실험용)
+- (v6) D가 통과하는 프록시를 찾으면 C → B → A 순서로 나눠 주고, 받은 서버가 프록시로 2번 막히면 다시 직접 접속으로 되돌아감
+       (서버끼리는 저장소의 proxy-bus 가지에 작은 파일을 주고받는 방식으로 대화)
 """
-import os, re, sys, json, time, random, datetime as dt
+import os, re, sys, json, time, random, base64, datetime as dt
 from urllib.parse import urlparse, unquote
 import requests
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -76,6 +78,19 @@ PROXY_LIST_URLS_ANY = [u.strip() for u in os.getenv("PROXY_LIST_URLS_ANY", ",".j
 NAV_TIMEOUT = 25000 if PROXY_FREE else 45000                              # 프록시는 느리거나 죽은 경우가 많아서 일찍 포기
 PROXY_NOW = ""                                                            # 지금 쓰는 프록시 (메시지에 표시)
 BAD_PROXIES = set()                                                       # 이번 실행에서 안 된 프록시
+
+# 서버끼리 프록시 주고받기 (D → C, B, A)
+GH_TOKEN = os.getenv("GH_TOKEN") or os.getenv("GITHUB_TOKEN") or ""
+REPO = os.getenv("GITHUB_REPOSITORY", "")
+BUS_BRANCH = os.getenv("BUS_BRANCH", "proxy-bus")                         # 주고받는 파일을 두는 가지(브랜치). 없으면 자동으로 만듦
+PROXY_SHARE = os.getenv("PROXY_SHARE", "true") == "true"                  # false면 서로 안 주고받고 D 혼자 실험
+BUS_ON = ON_GITHUB and PROXY_SHARE and bool(GH_TOKEN) and bool(REPO)
+SHARED = BUS_ON and WORKER in ("a", "b", "c") and not PROXY_FREE          # D에게서 프록시를 받을 수 있는 서버
+ORDER = ("c", "b", "a")                                                   # 프록시를 나눠 주는 순서
+PROXY_MAX_STRIKES = int(os.getenv("PROXY_MAX_STRIKES", "2"))              # 받은 프록시로 이만큼 막히면 직접 접속으로 복귀
+REASSIGN_COOLDOWN_MIN = int(os.getenv("REASSIGN_COOLDOWN_MIN", "10"))     # 복귀한 서버에 다시 프록시를 주기 전 쉬는 시간(분)
+PROXY_SEARCH_GAP_SEC = int(os.getenv("PROXY_SEARCH_GAP_SEC", "100"))      # 프록시 찾기를 너무 자주 하지 않도록 최소 간격
+BUS_SHA = {}
 STATE_FILE = "state.json"
 KST = dt.timezone(dt.timedelta(hours=9))
 BLOCK_RE = re.compile(r"비정상|제한되었|접속이 제한|access denied|forbidden|Reference #", re.I)
@@ -432,18 +447,40 @@ def find_working_proxies():
     return [], tested
 
 
+def refill_pool(holder, force=False):
+    """무료 프록시 후보를 시험해서 통과한 것을 holder['pool']에 보관 (너무 자주 하지 않도록 간격 제한)"""
+    now = time.time()
+    if not force and now - holder["last_search"] < PROXY_SEARCH_GAP_SEC:
+        return
+    holder["last_search"] = now
+    stage("무료 프록시 찾기")
+    good, holder["tested"] = find_working_proxies()
+    for g in good:
+        if g not in holder["pool"] and g not in BAD_PROXIES:
+            holder["pool"].append(g)
+
+
+def _avail(holder):
+    """통과했지만 아직 아무에게도 안 나눠 준 프록시"""
+    used = {a["proxy"] for a in holder["assign"].values()}
+    return [p for p in holder["pool"] if p not in BAD_PROXIES and p not in used]
+
+
 def ensure_free_proxy(holder):
-    """쓸 프록시가 없으면 찾고, 그 프록시로 브라우저를 새로 켠다. 하나도 없으면 None"""
+    """D 자신이 쓸 프록시를 고르고, 그 프록시로 브라우저를 켠다. 하나도 없으면 None.
+    다른 서버에 안 나눠 준 것을 먼저 쓰고, 없으면 나눠 준 것 중 하나를 같이 쓴다."""
     global PROXY_NOW
     if holder.get("proxy"):
         return holder["proxy"]
-    if not holder["queue"]:
-        stage("무료 프록시 찾기")
-        holder["queue"], holder["tested"] = find_working_proxies()
-    if not holder["queue"]:
+    pool = [p for p in holder["pool"] if p not in BAD_PROXIES]
+    if not pool:
+        refill_pool(holder)
+        pool = [p for p in holder["pool"] if p not in BAD_PROXIES]
+    if not pool:
         PROXY_NOW = ""
         return None
-    proxy = holder["queue"].pop(0)
+    used = {a["proxy"] for a in holder["assign"].values()}
+    proxy = ([p for p in pool if p not in used] or pool)[0]
     try:
         holder["browser"].close()
     except Exception:
@@ -471,6 +508,204 @@ def one_check_free(holder):
             BAD_PROXIES.add(proxy)
             holder["proxy"] = None
     raise last
+
+
+# ───────── 서버끼리 프록시 주고받기 (저장소의 proxy-bus 가지에 작은 파일로) ─────────
+# bus/d.json  : D가 씀. {"seq", "assign": {"c": {"proxy", "seq"}, ...}, "bad": [...]}
+# bus/a|b|c.json : 각 서버가 자기 것만 씀. {"mode", "proxy", "released_seq", "bad": [...]}
+# 파일은 서버마다 따로라서 두 서버가 같은 파일을 동시에 고치는 일이 없다. 프록시 주소와 숫자만 들어가고 비밀은 넣지 않는다.
+def _gh(method, path, **kw):
+    return requests.request(method, f"https://api.github.com/repos/{REPO}/{path}",
+                            headers={"Authorization": f"Bearer {GH_TOKEN}",
+                                     "Accept": "application/vnd.github+json",
+                                     "X-GitHub-Api-Version": "2022-11-28"}, timeout=15, **kw)
+
+
+def bus_init():
+    """proxy-bus 가지가 없으면 지금 커밋에서 만든다 (4대가 동시에 만들려 해도 문제없음)"""
+    try:
+        r = _gh("GET", f"git/ref/heads/{BUS_BRANCH}")
+        if r.status_code == 200:
+            print(f"proxy-bus 가지 확인: 있음")
+            return True
+        r = _gh("POST", "git/refs", json={"ref": f"refs/heads/{BUS_BRANCH}", "sha": os.getenv("GITHUB_SHA", "")})
+        print(f"proxy-bus 가지 만들기: HTTP {r.status_code}", "" if r.status_code in (201, 422) else r.text[:150])
+        return r.status_code in (201, 422)
+    except Exception as e:
+        print("proxy-bus 준비 오류:", str(e)[:100])
+        return False
+
+
+def bus_read(name):
+    """파일 내용(dict). 파일이 아직 없으면 {}, 읽기 실패면 None"""
+    try:
+        r = _gh("GET", f"contents/bus/{name}.json", params={"ref": BUS_BRANCH})
+        if r.status_code == 404:
+            BUS_SHA.pop(name, None)
+            return {}
+        if not r.ok:
+            print(f"bus 읽기 실패 {name}: HTTP {r.status_code}")
+            return None
+        j = r.json()
+        BUS_SHA[name] = j["sha"]
+        return json.loads(base64.b64decode(j["content"]).decode("utf-8"))
+    except Exception as e:
+        print("bus 읽기 오류:", str(e)[:100])
+        return None
+
+
+def bus_write(name, data):
+    body = {"message": f"bus {name}", "branch": BUS_BRANCH,
+            "content": base64.b64encode(json.dumps(data, ensure_ascii=False).encode("utf-8")).decode()}
+    for attempt in (1, 2):
+        try:
+            b = dict(body)
+            if BUS_SHA.get(name):
+                b["sha"] = BUS_SHA[name]
+            r = _gh("PUT", f"contents/bus/{name}.json", json=b)
+            if r.ok:
+                BUS_SHA[name] = r.json()["content"]["sha"]
+                return True
+            if r.status_code in (409, 422) and attempt == 1:
+                bus_read(name)   # 최신 sha를 받아서 한 번 더
+                continue
+            print(f"bus 쓰기 실패 {name}: HTTP {r.status_code} {r.text[:120]}")
+            return False
+        except Exception as e:
+            print("bus 쓰기 오류:", str(e)[:100])
+            return False
+    return False
+
+
+# --- D(프록시를 찾는 서버) 쪽 ---
+def scout_init(holder):
+    d = bus_read("d") or {}
+    holder["assign"] = d.get("assign") or {}
+    holder["seq"] = d.get("seq", 0)
+    BAD_PROXIES.update(d.get("bad", []))
+    print(f"D 시작: 기존 배정 {holder['assign']}")
+
+
+def scout_sync(holder):
+    """매 확인 전에: ① 서버들의 상태를 읽어 '직접 접속으로 복귀'한 서버의 배정을 거두고
+    ② 프록시가 필요한 서버(C → B → A 순서)에 통과한 프록시를 배정해서 파일에 쓴다"""
+    now = time.time()
+    asg, changed = holder["assign"], False
+    for w in ORDER:
+        st = bus_read(w)
+        if st is None:
+            continue
+        BAD_PROXIES.update(st.get("bad", []))
+        if w in asg and st.get("released_seq", 0) >= asg[w]["seq"]:
+            print(f"{w.upper()} 서버가 프록시 {asg[w]['proxy']}를 버리고 직접 접속으로 복귀 → 배정 회수")
+            BAD_PROXIES.add(asg[w]["proxy"])
+            del asg[w]
+            holder["cool"][w] = now + REASSIGN_COOLDOWN_MIN * 60
+            changed = True
+    need = [w for w in ORDER if w not in asg and now >= holder["cool"].get(w, 0)]
+    if need:
+        if len(_avail(holder)) < len(need):
+            refill_pool(holder)
+        avail, given = _avail(holder), []
+        for w in need:
+            if not avail:
+                break
+            p = avail.pop(0)
+            holder["seq"] += 1
+            asg[w] = {"proxy": p, "seq": holder["seq"]}
+            given.append(f"{w.upper()}←{p}")
+            changed = True
+        if given:
+            notify("📤 프록시 배정: " + ", ".join(given))
+    if changed:
+        bus_write("d", {"updated": int(now), "seq": holder["seq"], "assign": asg, "bad": sorted(BAD_PROXIES)[-100:]})
+
+
+# --- A, B, C(프록시를 받는 서버) 쪽 ---
+def worker_init(holder):
+    holder["my_status"] = bus_read(WORKER) or {}
+
+
+def _write_my_status(holder, **extra):
+    st = holder["my_status"]
+    st.update(extra)
+    st.update({"updated": int(time.time()), "mode": "proxy" if holder.get("proxy") else "direct",
+               "proxy": holder.get("proxy") or ""})
+    bus_write(WORKER, st)
+
+
+def apply_shared_proxy(holder, asg):
+    """D가 배정한 프록시로 브라우저를 새로 켠다"""
+    global PROXY_NOW
+    proxy = asg["proxy"]
+    try:
+        holder["browser"].close()
+    except Exception:
+        pass
+    holder["browser"] = launch_browser(holder["pw"], {"server": f"http://{proxy}"})
+    reset_browser(holder["browser"], holder)
+    holder.update(proxy=proxy, strikes=0, seq_applied=asg["seq"])
+    PROXY_NOW = proxy
+    print(f"D가 배정한 프록시로 전환: {proxy} (seq {asg['seq']})")
+    notify(f"🛡️ D가 찾은 프록시를 받아서 쓰기 시작해요 ({proxy})")
+    _write_my_status(holder)
+
+
+def release_shared_proxy(holder, why, mark_bad=True):
+    """프록시를 놓고 직접 접속으로 되돌아간다. mark_bad면 이 프록시는 다시 안 쓴다"""
+    global PROXY_NOW
+    proxy = holder.get("proxy")
+    if mark_bad and proxy:
+        BAD_PROXIES.add(proxy)
+    holder["proxy"] = None
+    PROXY_NOW = ""
+    try:
+        holder["browser"].close()
+    except Exception:
+        pass
+    holder["browser"] = launch_browser(holder["pw"])
+    reset_browser(holder["browser"], holder)
+    extra = {"released_seq": holder.get("seq_applied", 0)}
+    if mark_bad and proxy:
+        extra["bad"] = (holder["my_status"].get("bad", []) + [proxy])[-20:]
+    print(f"직접 접속으로 복귀: {why}")
+    notify(f"↩️ {why} — 직접 접속으로 돌아갑니다")
+    _write_my_status(holder, **extra)
+
+
+def worker_pull(holder):
+    """매 확인 전에: D의 파일에서 내 배정을 읽어 새 프록시가 있으면 갈아타고, 배정이 사라졌으면 직접 접속으로"""
+    d = bus_read("d")
+    if d is None:
+        return
+    BAD_PROXIES.update(d.get("bad", []))
+    asg = (d.get("assign") or {}).get(WORKER)
+    released = holder["my_status"].get("released_seq", 0)
+    if asg and asg["seq"] > released and asg["seq"] != holder.get("seq_applied") and asg["proxy"] not in BAD_PROXIES:
+        apply_shared_proxy(holder, asg)
+    elif holder.get("proxy") and not asg:
+        release_shared_proxy(holder, "D가 프록시 배정을 거두었어요", mark_bad=False)
+
+
+def one_check_shared(holder):
+    """받은 프록시로 확인. PROXY_MAX_STRIKES번 막히면 프록시를 버리고 직접 접속으로 같은 확인을 이어서 한다"""
+    for _ in range(PROXY_MAX_STRIKES):
+        try:
+            res = one_check(holder["browser"], holder, attempts=(1,))
+            holder["strikes"] = 0
+            return res
+        except Exception as e:
+            holder["strikes"] = holder.get("strikes", 0) + 1
+            print(f"받은 프록시 {holder['proxy']} 실패 {holder['strikes']}/{PROXY_MAX_STRIKES}: {str(e)[:100]}")
+    release_shared_proxy(holder, f"받은 프록시가 {PROXY_MAX_STRIKES}번 막혀서")
+    return one_check(holder["browser"], holder)
+
+
+def safe_call(fn, *a):
+    try:
+        return fn(*a)
+    except Exception as e:   # 서버끼리 대화가 실패해도 감시는 계속
+        print(f"({fn.__name__} 오류, 무시하고 계속):", str(e)[:120])
 
 
 # ───────── 예매 화면 열기 ─────────
@@ -679,7 +914,7 @@ def one_check(browser, holder, attempts=(1, 2, 3)):
             if attempt < (3 if e.soft else 2):   # 차단 판정 전에 새 브라우저로 한 번 더 확인 (빈 화면은 3번까지)
                 last = e
                 print(f"blocked? (try {attempt}, 단계: {STAGE}):", e)
-                if not e.soft and PROXY_CONF and not holder.get("proxy_on"):
+                if not e.soft and PROXY_CONF and not holder.get("proxy_on") and len(attempts) > 1:
                     use_proxy(holder)   # 직접 접속이 막혔으니 다음 시도부터 한국 IP 프록시로
                 continue
             raise
@@ -799,18 +1034,32 @@ def main():
     blocked_streak, streak, give_up = 0, 0, False
     end = time.time() + LOOP_MINUTES * 60
     with sync_playwright() as p:
-        holder = {"pw": p, "proxy_on": False, "queue": [], "proxy": None}
+        holder = {"pw": p, "proxy_on": False, "proxy": None, "pool": [], "assign": {}, "seq": 0, "cool": {},
+                  "last_search": 0, "tested": 0, "strikes": 0, "seq_applied": 0, "my_status": {}}
         if PROXY_FREE:
             holder["browser"] = None   # 프록시를 찾은 뒤에 브라우저를 켠다
         else:
             holder["browser"] = launch_browser(p)
             reset_browser(holder["browser"], holder)
+        if BUS_ON:
+            safe_call(bus_init)
+            if PROXY_FREE:
+                safe_call(scout_init, holder)
+            elif SHARED:
+                safe_call(worker_init, holder)
         print("브라우저 준비 완료 — 첫 확인을 시작합니다")
         while time.time() < end and not give_up:
             t0, pause = time.time(), None
             holder["fail_shot"] = None
+            if BUS_ON:   # 확인 전에 서버끼리 프록시 주고받기
+                safe_call(scout_sync if PROXY_FREE else worker_pull, holder) if (PROXY_FREE or SHARED) else None
             try:
-                enabled, status, img = one_check_free(holder) if PROXY_FREE else one_check(holder["browser"], holder)
+                if PROXY_FREE:
+                    enabled, status, img = one_check_free(holder)
+                elif holder.get("proxy"):
+                    enabled, status, img = one_check_shared(holder)
+                else:
+                    enabled, status, img = one_check(holder["browser"], holder)
                 blocked_streak = 0
                 streak += 1
                 on_success(enabled, status, img, streak)
