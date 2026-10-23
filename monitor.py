@@ -7,6 +7,7 @@ CGV 예매 오픈 감시 봇 v3 — 2개 서버 동시 감시 + 차단 시 즉�
 - (v2 유지) 날짜 줄 스크린샷, 정상 작동 알림, 단계별 자가 복구, 실패 순간의 화면 전송
 """
 import os, re, sys, json, time, datetime as dt
+from urllib.parse import urlparse, unquote
 import requests
 from playwright.sync_api import sync_playwright
 
@@ -21,17 +22,36 @@ THEATER = os.getenv("THEATER", "홍대")
 CUTOFF = dt.date.fromisoformat(os.getenv("CUTOFF_DATE", "2026-10-30"))   # 이 날짜 '이후(당일 포함)'
 LOOP_MINUTES = int(os.getenv("LOOP_MINUTES", "330"))
 INTERVAL = int(os.getenv("INTERVAL_SEC", "180"))          # 서버 1대의 확인 간격(초)
-SLOT_OFFSET = INTERVAL // 2 if WORKER == "b" else 0       # B는 A와 반 박자 엇갈리게
+SLOT_OFFSET = {"b": INTERVAL // 2, "pc": INTERVAL // 4}.get(WORKER, 0)   # B는 A와 반 박자, PC는 1/4 박자 엇갈리게
 SEND_START = os.getenv("SEND_START_MESSAGE", "false") == "true"
 HEARTBEAT_EVERY = int(os.getenv("HEARTBEAT_EVERY", "10"))  # 연속 N번 성공마다 정상 알림. 0이면 끔
 GAP_ALERT_MIN = int(os.getenv("GAP_ALERT_MIN", "60"))      # 이 시간 넘게 확인 못 하면 알림
-ERR_NOTICE_MIN = int(os.getenv("ERR_NOTICE_MIN", "10"))    # 문제 알림 최소 간격(분)
+ERR_NOTICE_MIN = int(os.getenv("ERR_NOTICE_MIN", "60"))    # 문제(🚫/⚠️) 알림 최소 간격(분). 차단이 계속될 때 도배 방지
 MAX_BLOCKED = int(os.getenv("MAX_BLOCKED", "1"))           # GitHub에서 연속 N번 차단되면 종료 → 새 서버로 재시작 (1 = 즉시)
 BLOCK_BACKOFF = int(os.getenv("BLOCK_BACKOFF_SEC", "30"))  # 차단→재시작이 연속될 때만 늘어나는 대기(초). 첫 차단은 대기 없음
 SHOT_MODE = os.getenv("SHOT_MODE", "edit")                 # edit: 한 메시지를 계속 수정 / each: 매번 새 메시지 / change: 상태 바뀔 때만 / off: 안 보냄
 MENTION = os.getenv("MENTION", "")                         # 예매 오픈 알림에 붙일 멘션. 예: "@everyone"
 LIGHT_MODE = os.getenv("LIGHT_MODE", "true") == "true"     # 이미지/폰트/추적 스크립트 안 받아서 빠르게
 ON_GITHUB = os.getenv("GITHUB_ACTIONS") == "true"
+PROXY_URL = (os.getenv("PROXY_URL") or "").strip()         # 예: http://아이디:비번@주소:포트 (한국 IP 프록시). 비어 있으면 프록시를 쓰지 않음
+
+
+def _proxy_conf(url):
+    if not url:
+        return None
+    try:
+        u = urlparse(url)
+        conf = {"server": f"{u.scheme}://{u.hostname}:{u.port}"}
+        if u.username:
+            conf["username"] = unquote(u.username)
+            conf["password"] = unquote(u.password or "")
+        return conf
+    except Exception:
+        print("PROXY_URL 형식이 올바르지 않아 프록시를 쓰지 않습니다 (예: http://아이디:비번@주소:포트)")
+        return None
+
+
+PROXY_CONF = _proxy_conf(PROXY_URL)
 STATE_FILE = "state.json"
 KST = dt.timezone(dt.timedelta(hours=9))
 BLOCK_RE = re.compile(r"비정상|제한되었|접속이 제한|access denied|forbidden|Reference #", re.I)
@@ -227,6 +247,25 @@ def reset_browser(browser, holder):
     holder["page"].set_default_timeout(20000)
 
 
+def launch_browser(p, proxy=None):
+    channel = os.getenv("BROWSER_CHANNEL") or None   # "chrome" = 러너에 깔린 Chrome 사용 (브라우저 설치 생략)
+    kw = {"proxy": proxy} if proxy else {}
+    return p.chromium.launch(channel=channel, headless=True,
+                             args=["--disable-gpu", "--no-sandbox", "--disable-dev-shm-usage"], **kw)
+
+
+def use_proxy(holder):
+    """직접 접속이 막혔을 때: 프록시를 낀 새 브라우저로 갈아탄다 (이번 실행 동안 유지)"""
+    try:
+        holder["browser"].close()
+    except Exception:
+        pass
+    holder["browser"] = launch_browser(holder["pw"], PROXY_CONF)
+    holder["proxy_on"] = True
+    print("직접 접속이 막혀 프록시로 전환합니다")
+    notify("🛡️ 직접 접속이 막혀서 프록시로 전환했어요")
+
+
 def body_text(page):
     try:
         return (page.inner_text("body", timeout=3000) or "")[:300].replace("\n", " ")
@@ -418,7 +457,7 @@ def one_check(browser, holder):
     for attempt in (1, 2, 3):
         try:
             if attempt > 1 or not holder.get("page") or holder["page"].is_closed():
-                reset_browser(browser, holder)
+                reset_browser(holder["browser"], holder)
                 if attempt > 1:
                     time.sleep(3 * attempt)
             return check(holder["page"], force_full=(attempt > 1))
@@ -428,6 +467,8 @@ def one_check(browser, holder):
             if attempt < (3 if e.soft else 2):   # 차단 판정 전에 새 브라우저로 한 번 더 확인 (빈 화면은 3번까지)
                 last = e
                 print(f"blocked? (try {attempt}, 단계: {STAGE}):", e)
+                if not e.soft and PROXY_CONF and not holder.get("proxy_on"):
+                    use_proxy(holder)   # 직접 접속이 막혔으니 다음 시도부터 한국 IP 프록시로
                 continue
             raise
         except Exception as e:
@@ -540,16 +581,14 @@ def main():
     blocked_streak, streak, give_up = 0, 0, False
     end = time.time() + LOOP_MINUTES * 60
     with sync_playwright() as p:
-        channel = os.getenv("BROWSER_CHANNEL") or None   # "chrome" = 러너에 깔린 Chrome 사용 (브라우저 설치 생략)
-        browser = p.chromium.launch(channel=channel, headless=True,
-                                    args=["--disable-gpu", "--no-sandbox", "--disable-dev-shm-usage"])
-        holder = {}
-        reset_browser(browser, holder)
+        holder = {"pw": p, "proxy_on": False}
+        holder["browser"] = launch_browser(p)
+        reset_browser(holder["browser"], holder)
         while time.time() < end and not give_up:
             t0, pause = time.time(), None
             holder["fail_shot"] = None
             try:
-                enabled, status, img = one_check(browser, holder)
+                enabled, status, img = one_check(holder["browser"], holder)
                 blocked_streak = 0
                 streak += 1
                 on_success(enabled, status, img, streak)
@@ -584,7 +623,10 @@ def main():
                 holder[k].close()
             except Exception:
                 pass
-        browser.close()
+        try:
+            holder["browser"].close()
+        except Exception:
+            pass
     if give_up:
         # 첫 차단은 대기 없이 바로 재시작. 차단→재시작이 연속될 때만 조금씩 쉬어서 CGV를 계속 두드리지 않게 함
         n = STATE.get("block_exits", 1)
