@@ -83,10 +83,15 @@ def set_state(**kw):
         print("state save error:", e)
 
 
-# ───────── 디스코드 (모든 메시지 앞에 [A]/[B] 표시) ─────────
+# ───────── 디스코드 (모든 메시지 앞에 [A]/[B]와 보낸 시각(초 포함) 표시) ─────────
+def stamp(msg):
+    """메시지 앞에 '[A] 17:41:23 ' 형태로 서버와 시각(한국 시간)을 붙인다"""
+    return f"{TAG}{dt.datetime.now(KST).strftime('%H:%M:%S')} {msg}"
+
+
 def notify(msg):
     try:
-        requests.post(WEBHOOK, json={"content": (TAG + msg)[:1900]}, timeout=15)
+        requests.post(WEBHOOK, json={"content": stamp(msg)[:1900]}, timeout=15)
     except Exception as e:
         print("discord error:", e)
 
@@ -94,7 +99,7 @@ def notify(msg):
 def post_with_image(msg, img, name="shot.jpg"):
     """새 메시지 + 이미지. 성공하면 메시지 id 반환"""
     try:
-        r = requests.post(WEBHOOK, params={"wait": "true"}, data={"content": (TAG + msg)[:1900]},
+        r = requests.post(WEBHOOK, params={"wait": "true"}, data={"content": stamp(msg)[:1900]},
                           files={"file": (name, img, "image/jpeg")}, timeout=30)
         return r.json().get("id") if r.ok else None
     except Exception as e:
@@ -109,7 +114,7 @@ def edit_with_image(msg, img):
         try:
             r = requests.patch(
                 f"{WEBHOOK}/messages/{mid}",
-                data={"payload_json": json.dumps({"content": (TAG + msg)[:1900], "attachments": []})},
+                data={"payload_json": json.dumps({"content": stamp(msg)[:1900], "attachments": []})},
                 files={"files[0]": ("shot.jpg", img, "image/jpeg")}, timeout=30)
             if r.ok:
                 return
@@ -460,7 +465,7 @@ def on_success(enabled, status, img, streak):
     print(t, "status:", status, f"(연속 {streak}회)")
 
     if STATE.get("problem"):
-        notify(f"✅ [{t}] 다시 정상적으로 확인되고 있어요 | 날짜: {status}")
+        notify(f"✅ 다시 정상적으로 확인되고 있어요 | 날짜: {status}")
         set_state(problem=False)
     set_state(last_ok=now, block_exits=0)
 
@@ -488,7 +493,7 @@ def on_success(enabled, status, img, streak):
 
     # 날짜 화면 스크린샷
     near = [d for d in enabled if d >= CUTOFF]
-    caption = (f"📅 [{t}] 날짜 상태: {status}\n{CUTOFF} 이후 열림: "
+    caption = (f"📅 날짜 상태: {status}\n{CUTOFF} 이후 열림: "
                + (", ".join(d.strftime("%m/%d") for d in near) if near else "없음")
                + f" | 연속 {streak}회 정상")
     if SHOT_MODE == "change":
@@ -501,7 +506,7 @@ def on_success(enabled, status, img, streak):
     # 정상 작동 알림: 연속 HEARTBEAT_EVERY번 성공할 때마다
     if HEARTBEAT_EVERY and streak % HEARTBEAT_EVERY == 0:
         minutes = streak * INTERVAL // 60
-        notify(f"🔄 [{t}] 정상 작동 중 — 연속 {streak}회 성공(약 {minutes}분) | 날짜: {status} | "
+        notify(f"🔄 정상 작동 중 — 연속 {streak}회 성공(약 {minutes}분) | 날짜: {status} | "
                f"{CUTOFF} 이후 열림: " + (", ".join(d.strftime("%m/%d") for d in near) if near else "없음"))
 
 
