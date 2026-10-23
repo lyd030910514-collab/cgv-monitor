@@ -66,14 +66,14 @@ jobs:
           key: state-${{ matrix.worker }}-${{ github.run_id }}
           restore-keys: state-${{ matrix.worker }}-
 
-      # 브라우저를 매번 새로 받지 않도록 캐시 (A, B가 같은 키를 저장하려다 한쪽이 경고를 낼 수 있지만 정상)
+      # 브라우저를 매번 새로 받지 않도록 캐시
       - uses: actions/cache@v4
         with:
           path: ~/.cache/ms-playwright
           key: pw-${{ runner.os }}-${{ hashFiles('requirements.txt') }}
 
-      # 브라우저: 러너에 이미 깔려 있는 Chrome을 쓰면 몇 초면 끝납니다 (apt 다운로드가 멈추는 일이 없음).
-      # Chrome이 없을 때만 예전처럼 직접 설치하고, 8분 넘게 걸리면 중단해서 새 서버로 다시 시작합니다.
+      # 브라우저: 러너에 이미 깔려 있는 Chrome을 쓰면 몇 초면 끝납니다.
+      # Chrome이 없을 때만 직접 설치하고, 8분 넘게 걸리면 중단해서 새 서버로 다시 시작합니다.
       - name: Prepare browser
         timeout-minutes: 8
         run: |
@@ -85,8 +85,10 @@ jobs:
             playwright install --with-deps chromium
           fi
 
-      - run: python monitor.py
+      - name: Run monitor
+        run: python -u monitor.py        # -u: 출력을 바로바로 로그에 찍음
         env:
+          PYTHONUNBUFFERED: "1"
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
           PROXY_URL: ${{ secrets.PROXY_URL }}   # 선택: 한국 IP 프록시 (없으면 비워 두면 됨)
           WORKER: ${{ matrix.worker }}
@@ -95,7 +97,8 @@ jobs:
           LOOP_MINUTES: ${{ inputs.minutes || '330' }}
           INTERVAL_SEC: "180"      # 서버 1대 기준 간격. B는 절반만큼 엇갈려서 합치면 약 90초마다 확인
           HEARTBEAT_EVERY: "10"
-          SHOT_MODE: "edit"        # edit | each | change | off
+          SHOT_MODE: "each"        # each: 확인마다 새 메시지 | edit: 한 메시지 수정 | change | off
+          ERR_NOTICE_MIN: "0"      # 0 = 차단/오류도 확인할 때마다 알림
           MAX_BLOCKED: "1"         # 차단 1번이면 바로 종료 → 새 서버로 재시작
           MENTION: ""              # 예매 오픈 알림 멘션. 예: "@everyone"
 
