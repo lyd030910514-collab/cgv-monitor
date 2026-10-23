@@ -1,0 +1,82 @@
+name: CGV Monitor
+
+on:
+  workflow_dispatch:
+    inputs:
+      restart:
+        description: "자동 재시작 여부 (직접 실행 시 false)"
+        default: "false"
+      minutes:
+        description: "이번 실행 유지 시간(분). 테스트는 5, 평소는 330"
+        default: "330"
+  schedule:
+    - cron: "*/20 * * * *"   # 끊겼을 때를 위한 백업
+
+concurrency:
+  group: cgv-monitor
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  actions: write
+
+jobs:
+  watch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      # 이전 실행의 상태(알린 날짜, 예매 화면 주소, 스크린샷 메시지 id) 복원
+      - uses: actions/cache/restore@v4
+        with:
+          path: state.json
+          key: state-${{ github.run_id }}
+          restore-keys: state-
+
+      # 브라우저를 매번 새로 받지 않도록 캐시
+      - uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: pw-${{ runner.os }}-${{ hashFiles('requirements.txt') }}
+
+      - run: |
+          pip install -r requirements.txt
+          playwright install --with-deps chromium
+
+      - run: python monitor.py
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          SEND_START_MESSAGE: ${{ github.event_name == 'workflow_dispatch' && inputs.restart != 'true' }}
+          CUTOFF_DATE: "2026-10-30"
+          LOOP_MINUTES: ${{ inputs.minutes || '330' }}
+          INTERVAL_SEC: "180"
+          HEARTBEAT_EVERY: "10"
+          SHOT_MODE: "edit"        # edit | each | change | off
+          MENTION: ""              # 예매 오픈 알림 멘션. 예: "@everyone"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: debug
+          path: debug.jpg
+          if-no-files-found: ignore
+
+      - name: Save state
+        if: always() && hashFiles('state.dirty') != ''
+        uses: actions/cache/save@v4
+        with:
+          path: state.json
+          key: state-${{ github.run_id }}
+
+      # 끝나면 스스로 다시 실행 (수동 취소 시에는 재시작 안 함)
+      - name: Restart itself
+        if: success() || failure()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow run monitor.yml --repo ${{ github.repository }} --ref ${{ github.ref_name }} -f restart=true -f minutes=330
