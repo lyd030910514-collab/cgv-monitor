@@ -10,19 +10,19 @@ on:
         description: "이번 실행 유지 시간(분). 테스트는 5, 평소는 330"
         default: "330"
       worker:
-        description: "감시 서버. both = A·B 동시(평소), a 또는 b = 하나만 (자동 재시작이 쓰는 값이라 보통 건드리지 않아요)"
+        description: "감시 서버. both = A·B·C·D 모두(평소), 한 글자 = 그 서버만 (자동 재시작이 쓰는 값이라 보통 건드리지 않아요)"
         type: choice
-        options: [both, a, b]
+        options: [both, a, b, c, d]
         default: both
   schedule:
-    - cron: "*/20 * * * *"   # 끊겼을 때를 위한 백업 (A, B 둘 다 확인해서 빠진 쪽만 다시 켬)
+    - cron: "*/20 * * * *"   # 끊겼을 때를 위한 백업 (서버마다 확인해서 빠진 쪽만 다시 켬)
 
 permissions:
   contents: read
   actions: write
 
 jobs:
-  # 이번 실행에서 어떤 서버를 띄울지 결정 (cron/수동 기본 = A, B 둘 다 / 자동 재시작 = 끝난 서버 하나만)
+  # 이번 실행에서 어떤 서버를 띄울지 결정 (cron/수동 기본 = A·B·C·D 모두 / 자동 재시작 = 끝난 서버 하나만)
   plan:
     runs-on: ubuntu-latest
     timeout-minutes: 2
@@ -34,9 +34,8 @@ jobs:
           W: ${{ inputs.worker }}
         run: |
           case "$W" in
-            a) echo 'workers=["a"]' >> "$GITHUB_OUTPUT" ;;
-            b) echo 'workers=["b"]' >> "$GITHUB_OUTPUT" ;;
-            *) echo 'workers=["a","b"]' >> "$GITHUB_OUTPUT" ;;
+            a|b|c|d) echo "workers=[\"$W\"]" >> "$GITHUB_OUTPUT" ;;
+            *) echo 'workers=["a","b","c","d"]' >> "$GITHUB_OUTPUT" ;;
           esac
 
   watch:
@@ -49,7 +48,7 @@ jobs:
       matrix:
         worker: ${{ fromJSON(needs.plan.outputs.workers) }}
     concurrency:
-      group: cgv-monitor-${{ matrix.worker }}   # 서버별로 하나씩만 (A는 A끼리, B는 B끼리)
+      group: cgv-monitor-${{ matrix.worker }}   # 서버별로 하나씩만 (A는 A끼리, B는 B끼리 ...)
       cancel-in-progress: false
     steps:
       - uses: actions/checkout@v4
@@ -59,7 +58,7 @@ jobs:
           python-version: "3.12"
           cache: pip
 
-      # 이전 실행의 상태(알린 날짜, 예매 화면 주소, 스크린샷 메시지 id) 복원. A와 B는 각자 따로 저장
+      # 이전 실행의 상태(알린 날짜, 예매 화면 주소, 스크린샷 메시지 id) 복원. 서버마다 각자 따로 저장
       - uses: actions/cache/restore@v4
         with:
           path: state.json
@@ -92,13 +91,14 @@ jobs:
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
           PROXY_URL: ${{ secrets.PROXY_URL }}   # 선택: 한국 IP 프록시 (없으면 비워 두면 됨)
           WORKER: ${{ matrix.worker }}
+          PROXY_MODE: ${{ matrix.worker == 'd' && 'free' || '' }}   # 서버 D만: 무료 한국 프록시를 찾아서 접속
           SEND_START_MESSAGE: ${{ github.event_name == 'workflow_dispatch' && inputs.restart != 'true' }}
           CUTOFF_DATE: "2026-10-30"
           LOOP_MINUTES: ${{ inputs.minutes || '330' }}
-          INTERVAL_SEC: "180"      # 서버 1대 기준 간격. B는 절반만큼 엇갈려서 합치면 약 90초마다 확인
+          INTERVAL_SEC: "180"      # 서버 1대 기준 간격. 4대가 45초씩 엇갈려서 합치면 약 45초마다 확인
           HEARTBEAT_EVERY: "10"
-          SHOT_MODE: "each"        # each: 확인마다 새 메시지 | edit: 한 메시지 수정 | change | off
-          ERR_NOTICE_MIN: "0"      # 0 = 차단/오류도 확인할 때마다 알림
+          SHOT_MODE: ${{ matrix.worker == 'd' && 'each' || 'edit' }}   # each: 확인마다 새 메시지 | edit: 한 메시지 수정 | change | off
+          ERR_NOTICE_MIN: "10"     # 차단/오류 알림은 서버마다 10분에 한 번 (0 = 확인할 때마다)
           MAX_BLOCKED: "1"         # 차단 1번이면 바로 종료 → 새 서버로 재시작
           MENTION: ""              # 예매 오픈 알림 멘션. 예: "@everyone"
 
