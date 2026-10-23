@@ -9,21 +9,48 @@ on:
       minutes:
         description: "이번 실행 유지 시간(분). 테스트는 5, 평소는 330"
         default: "330"
+      worker:
+        description: "감시 서버. both = A·B 동시(평소), a 또는 b = 하나만 (자동 재시작이 쓰는 값이라 보통 건드리지 않아요)"
+        type: choice
+        options: [both, a, b]
+        default: both
   schedule:
-    - cron: "*/20 * * * *"   # 끊겼을 때를 위한 백업
-
-concurrency:
-  group: cgv-monitor
-  cancel-in-progress: false
+    - cron: "*/20 * * * *"   # 끊겼을 때를 위한 백업 (A, B 둘 다 확인해서 빠진 쪽만 다시 켬)
 
 permissions:
   contents: read
   actions: write
 
 jobs:
+  # 이번 실행에서 어떤 서버를 띄울지 결정 (cron/수동 기본 = A, B 둘 다 / 자동 재시작 = 끝난 서버 하나만)
+  plan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    outputs:
+      workers: ${{ steps.p.outputs.workers }}
+    steps:
+      - id: p
+        env:
+          W: ${{ inputs.worker }}
+        run: |
+          case "$W" in
+            a) echo 'workers=["a"]' >> "$GITHUB_OUTPUT" ;;
+            b) echo 'workers=["b"]' >> "$GITHUB_OUTPUT" ;;
+            *) echo 'workers=["a","b"]' >> "$GITHUB_OUTPUT" ;;
+          esac
+
   watch:
+    name: watch (${{ matrix.worker }})
+    needs: plan
     runs-on: ubuntu-latest
     timeout-minutes: 350
+    strategy:
+      fail-fast: false          # 한쪽이 실패해도 다른 쪽은 계속
+      matrix:
+        worker: ${{ fromJSON(needs.plan.outputs.workers) }}
+    concurrency:
+      group: cgv-monitor-${{ matrix.worker }}   # 서버별로 하나씩만 (A는 A끼리, B는 B끼리)
+      cancel-in-progress: false
     steps:
       - uses: actions/checkout@v4
 
@@ -32,14 +59,14 @@ jobs:
           python-version: "3.12"
           cache: pip
 
-      # 이전 실행의 상태(알린 날짜, 예매 화면 주소, 스크린샷 메시지 id) 복원
+      # 이전 실행의 상태(알린 날짜, 예매 화면 주소, 스크린샷 메시지 id) 복원. A와 B는 각자 따로 저장
       - uses: actions/cache/restore@v4
         with:
           path: state.json
-          key: state-${{ github.run_id }}
-          restore-keys: state-
+          key: state-${{ matrix.worker }}-${{ github.run_id }}
+          restore-keys: state-${{ matrix.worker }}-
 
-      # 브라우저를 매번 새로 받지 않도록 캐시
+      # 브라우저를 매번 새로 받지 않도록 캐시 (A, B가 같은 키를 저장하려다 한쪽이 경고를 낼 수 있지만 정상)
       - uses: actions/cache@v4
         with:
           path: ~/.cache/ms-playwright
@@ -52,18 +79,20 @@ jobs:
       - run: python monitor.py
         env:
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          WORKER: ${{ matrix.worker }}
           SEND_START_MESSAGE: ${{ github.event_name == 'workflow_dispatch' && inputs.restart != 'true' }}
           CUTOFF_DATE: "2026-10-30"
           LOOP_MINUTES: ${{ inputs.minutes || '330' }}
-          INTERVAL_SEC: "180"
+          INTERVAL_SEC: "180"      # 서버 1대 기준 간격. B는 절반만큼 엇갈려서 합치면 약 90초마다 확인
           HEARTBEAT_EVERY: "10"
           SHOT_MODE: "edit"        # edit | each | change | off
+          MAX_BLOCKED: "1"         # 차단 1번이면 바로 종료 → 새 서버로 재시작
           MENTION: ""              # 예매 오픈 알림 멘션. 예: "@everyone"
 
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: debug
+          name: debug-${{ matrix.worker }}
           path: debug.jpg
           if-no-files-found: ignore
 
@@ -72,11 +101,11 @@ jobs:
         uses: actions/cache/save@v4
         with:
           path: state.json
-          key: state-${{ github.run_id }}
+          key: state-${{ matrix.worker }}-${{ github.run_id }}
 
-      # 끝나면 스스로 다시 실행 (수동 취소 시에는 재시작 안 함)
+      # 끝나면 이 서버만 스스로 다시 실행 (수동 취소 시에는 재시작 안 함)
       - name: Restart itself
         if: success() || failure()
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh workflow run monitor.yml --repo ${{ github.repository }} --ref ${{ github.ref_name }} -f restart=true -f minutes=330
+        run: gh workflow run monitor.yml --repo ${{ github.repository }} --ref ${{ github.ref_name }} -f restart=true -f minutes=330 -f worker=${{ matrix.worker }}
