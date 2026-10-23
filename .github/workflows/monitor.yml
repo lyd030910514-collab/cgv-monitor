@@ -88,6 +88,7 @@ jobs:
       - run: python monitor.py
         env:
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          PROXY_URL: ${{ secrets.PROXY_URL }}   # 선택: 한국 IP 프록시 (없으면 비워 두면 됨)
           WORKER: ${{ matrix.worker }}
           SEND_START_MESSAGE: ${{ github.event_name == 'workflow_dispatch' && inputs.restart != 'true' }}
           CUTOFF_DATE: "2026-10-30"
