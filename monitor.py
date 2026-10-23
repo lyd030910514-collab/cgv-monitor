@@ -27,7 +27,7 @@ HEARTBEAT_EVERY = int(os.getenv("HEARTBEAT_EVERY", "10"))  # 연속 N번 성공�
 GAP_ALERT_MIN = int(os.getenv("GAP_ALERT_MIN", "60"))      # 이 시간 넘게 확인 못 하면 알림
 ERR_NOTICE_MIN = int(os.getenv("ERR_NOTICE_MIN", "10"))    # 문제 알림 최소 간격(분)
 MAX_BLOCKED = int(os.getenv("MAX_BLOCKED", "1"))           # GitHub에서 연속 N번 차단되면 종료 → 새 서버로 재시작 (1 = 즉시)
-BLOCK_BACKOFF = int(os.getenv("BLOCK_BACKOFF_SEC", "10"))  # 차단→재시작이 연속될 때만 늘어나는 대기(초). 첫 차단은 대기 없음
+BLOCK_BACKOFF = int(os.getenv("BLOCK_BACKOFF_SEC", "30"))  # 차단→재시작이 연속될 때만 늘어나는 대기(초). 첫 차단은 대기 없음
 SHOT_MODE = os.getenv("SHOT_MODE", "edit")                 # edit: 한 메시지를 계속 수정 / each: 매번 새 메시지 / change: 상태 바뀔 때만 / off: 안 보냄
 MENTION = os.getenv("MENTION", "")                         # 예매 오픈 알림에 붙일 멘션. 예: "@everyone"
 LIGHT_MODE = os.getenv("LIGHT_MODE", "true") == "true"     # 이미지/폰트/추적 스크립트 안 받아서 빠르게
@@ -393,9 +393,7 @@ def check(page, force_full):
     if not force_full and STATE.get("book_url"):
         try:
             open_fast(page)
-        except Blocked:
-            raise
-        except Exception as e:
+        except Exception as e:   # 차단처럼 보여도 '저장된 주소로 바로 접속'만 막힌 걸 수 있어서, 검색 경로로 한 번 더 시도
             print("fast path failed → full path:", e)
             open_via_search(page)
     else:
@@ -409,8 +407,8 @@ def one_check(browser, holder):
        1차) 열려 있는 페이지로 빠른 확인
        2차) 브라우저를 새로 만들고 처음부터(검색 경로)
        3차) 잠깐 쉬고 한 번 더. 그래도 안 되면 실패 순간의 화면을 holder['fail_shot']에 남김
-       단, 확실한 접속 제한(403/429, 차단 문구)은 재시도 없이 바로 Blocked로 올려보낸다.
-       '빈 화면'처럼 불확실한 경우만 3차까지 재시도한 뒤 차단으로 본다."""
+       접속 제한(403/429, 차단 문구)처럼 보여도 새 브라우저로 처음부터 한 번 더 확인해서(약 10초)
+       그래도 막히면 그때 Blocked로 올려보낸다. '빈 화면'은 3차까지 재시도한 뒤 차단으로 본다."""
     last = None
     for attempt in (1, 2, 3):
         try:
@@ -422,9 +420,9 @@ def one_check(browser, holder):
         except Blocked as e:
             holder["fail_shot"] = snap(holder["page"], full_page=False)
             holder["fail_stage"] = STAGE
-            if e.soft and attempt < 3:
+            if attempt < (3 if e.soft else 2):   # 차단 판정 전에 새 브라우저로 한 번 더 확인 (빈 화면은 3번까지)
                 last = e
-                print(f"empty page (try {attempt}, 단계: {STAGE}):", e)
+                print(f"blocked? (try {attempt}, 단계: {STAGE}):", e)
                 continue
             raise
         except Exception as e:
