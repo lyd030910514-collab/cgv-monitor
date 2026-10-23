@@ -1,30 +1,33 @@
 """
-CGV 예매 오픈 감시 봇 v2
+CGV 예매 오픈 감시 봇 v3 — 2개 서버 동시 감시 + 차단 시 즉시 갈아타기
 
-- 3분마다 확인 → 날짜 줄 스크린샷을 디스코드로 전송 (기본: 같은 메시지를 계속 수정)
-- 연속 10번(= 약 30분) 정상이면 "정상 작동 중" 알림
-- 문제가 생기면 단계별로 재시도 → 그래도 안 되면 그 순간의 화면을 찍어서 전송
-- 빠르게: 브라우저/페이지를 계속 유지하고 새로고침만, 고정 대기 대신 조건 대기
+- GitHub에서 서버 A, B 두 개가 동시에 감시합니다. 서버(IP)가 서로 달라서 둘이 한꺼번에 막힐 확률이 낮아요.
+- 확인 시각을 엇갈리게 맞춥니다. A는 0초, B는 간격의 절반(180초 기준 90초)이라 실질 확인 간격이 약 90초가 됩니다.
+- 접속 제한(403 등)을 만나면 재시도나 대기 없이 바로 종료합니다. 워크플로가 새 서버(새 IP)로 다시 시작해요.
+- (v2 유지) 날짜 줄 스크린샷, 정상 작동 알림, 단계별 자가 복구, 실패 순간의 화면 전송
 """
-import os, re, json, time, datetime as dt
+import os, re, sys, json, time, datetime as dt
 import requests
 from playwright.sync_api import sync_playwright
 
 # ───────── 설정 (환경변수로 바꿀 수 있음) ─────────
-WEBHOOK = os.getenv("DISCORD_WEBHOOK_URL") or "https://discord.com/api/webhooks/1562771316803903560/2ra2oMnp9HWoyRodHR_C1mL4KvhK5vFRYuRfNpg1yjQ4nRU7WtoB2m5vYNme8dhAo7pR"
+WEBHOOK = (os.getenv("DISCORD_WEBHOOK_URL") or "https://discord.com/api/webhooks/1562771316803903560/2ra2oMnp9HWoyRodHR_C1mL4KvhK5vFRYuRfNpg1yjQ4nRU7WtoB2m5vYNme8dhAo7pR").strip()   # Secret이 있으면 그걸 우선 사용
+WORKER = (os.getenv("WORKER") or "").strip().lower()         # "a" / "b" / 빈값(혼자 실행)
+TAG = f"[{WORKER.upper()}] " if WORKER else ""               # 디스코드 메시지 앞에 붙는 서버 표시
 BASE = os.getenv("CGV_BASE", "https://cgv.co.kr")
 KEYWORD = os.getenv("KEYWORD", "요루시카")
 MOVIE_TITLE = os.getenv("MOVIE_TITLE", "도작")            # 검색 결과 중 이 글자가 들어간 작품
 THEATER = os.getenv("THEATER", "홍대")
 CUTOFF = dt.date.fromisoformat(os.getenv("CUTOFF_DATE", "2026-10-30"))   # 이 날짜 '이후(당일 포함)'
 LOOP_MINUTES = int(os.getenv("LOOP_MINUTES", "330"))
-INTERVAL = int(os.getenv("INTERVAL_SEC", "180"))          # 확인 간격(초). 시작 시각 기준
+INTERVAL = int(os.getenv("INTERVAL_SEC", "180"))          # 서버 1대의 확인 간격(초)
+SLOT_OFFSET = INTERVAL // 2 if WORKER == "b" else 0       # B는 A와 반 박자 엇갈리게
 SEND_START = os.getenv("SEND_START_MESSAGE", "false") == "true"
-HEARTBEAT_EVERY = int(os.getenv("HEARTBEAT_EVERY", "10"))  # 연속 N번 성공마다 정상 알림 (10번 x 3분 = 30분). 0이면 끔
+HEARTBEAT_EVERY = int(os.getenv("HEARTBEAT_EVERY", "10"))  # 연속 N번 성공마다 정상 알림. 0이면 끔
 GAP_ALERT_MIN = int(os.getenv("GAP_ALERT_MIN", "60"))      # 이 시간 넘게 확인 못 하면 알림
 ERR_NOTICE_MIN = int(os.getenv("ERR_NOTICE_MIN", "10"))    # 문제 알림 최소 간격(분)
-MAX_BLOCKED = int(os.getenv("MAX_BLOCKED", "2"))           # GitHub에서 연속 차단 시 새 서버로 재시작
-BLOCK_COOLDOWN = int(os.getenv("BLOCK_COOLDOWN_SEC", "60"))
+MAX_BLOCKED = int(os.getenv("MAX_BLOCKED", "1"))           # GitHub에서 연속 N번 차단되면 종료 → 새 서버로 재시작 (1 = 즉시)
+BLOCK_BACKOFF = int(os.getenv("BLOCK_BACKOFF_SEC", "10"))  # 차단→재시작이 연속될 때만 늘어나는 대기(초). 첫 차단은 대기 없음
 SHOT_MODE = os.getenv("SHOT_MODE", "edit")                 # edit: 한 메시지를 계속 수정 / each: 매번 새 메시지 / change: 상태 바뀔 때만 / off: 안 보냄
 MENTION = os.getenv("MENTION", "")                         # 예매 오픈 알림에 붙일 멘션. 예: "@everyone"
 LIGHT_MODE = os.getenv("LIGHT_MODE", "true") == "true"     # 이미지/폰트/추적 스크립트 안 받아서 빠르게
@@ -37,7 +40,11 @@ TRACKERS = ("google-analytics", "googletagmanager", "doubleclick", "facebook.net
 
 
 class Blocked(Exception):
-    """CGV가 이 서버(IP)의 접속을 막은 경우"""
+    """CGV가 이 서버(IP)의 접속을 막은 경우. soft=True는 '빈 화면'처럼 확실하지 않은 경우"""
+
+    def __init__(self, msg="", soft=False):
+        super().__init__(msg)
+        self.soft = soft
 
 
 class Changed(Exception):
@@ -76,10 +83,10 @@ def set_state(**kw):
         print("state save error:", e)
 
 
-# ───────── 디스코드 ─────────
+# ───────── 디스코드 (모든 메시지 앞에 [A]/[B] 표시) ─────────
 def notify(msg):
     try:
-        requests.post(WEBHOOK, json={"content": msg[:1900]}, timeout=15)
+        requests.post(WEBHOOK, json={"content": (TAG + msg)[:1900]}, timeout=15)
     except Exception as e:
         print("discord error:", e)
 
@@ -87,7 +94,7 @@ def notify(msg):
 def post_with_image(msg, img, name="shot.jpg"):
     """새 메시지 + 이미지. 성공하면 메시지 id 반환"""
     try:
-        r = requests.post(WEBHOOK, params={"wait": "true"}, data={"content": msg[:1900]},
+        r = requests.post(WEBHOOK, params={"wait": "true"}, data={"content": (TAG + msg)[:1900]},
                           files={"file": (name, img, "image/jpeg")}, timeout=30)
         return r.json().get("id") if r.ok else None
     except Exception as e:
@@ -96,13 +103,13 @@ def post_with_image(msg, img, name="shot.jpg"):
 
 
 def edit_with_image(msg, img):
-    """이전에 보낸 메시지를 최신 내용+이미지로 교체. 실패하면 새로 보냄"""
+    """이전에 보낸 메시지를 최신 내용+이미지로 교체. 실패하면 새로 보냄 (서버별로 각자 메시지 1개)"""
     mid = STATE.get("shot_msg")
     if mid:
         try:
             r = requests.patch(
                 f"{WEBHOOK}/messages/{mid}",
-                data={"payload_json": json.dumps({"content": msg[:1900], "attachments": []})},
+                data={"payload_json": json.dumps({"content": (TAG + msg)[:1900], "attachments": []})},
                 files={"files[0]": ("shot.jpg", img, "image/jpeg")}, timeout=30)
             if r.ok:
                 return
@@ -224,8 +231,11 @@ def body_text(page):
 
 def detect_block(page):
     body = body_text(page)
-    if BLOCK_RE.search(body) or len(body.strip()) < 20:
-        raise Blocked(f"접속 제한/빈 화면: {body[:80]}")
+    if BLOCK_RE.search(body):
+        raise Blocked(f"접속 제한: {body[:80]}")
+    if len(body.strip()) < 20:
+        # 빈 화면은 일시적일 수도 있어서 'soft'로 표시 (재시도를 먼저 해 봄)
+        raise Blocked(f"빈 화면: {body[:80]}", soft=True)
 
 
 def click_any(label, candidates, timeout=6000):
@@ -398,7 +408,9 @@ def one_check(browser, holder):
     """확인 1회. 실패하면 단계적으로 다시 시도:
        1차) 열려 있는 페이지로 빠른 확인
        2차) 브라우저를 새로 만들고 처음부터(검색 경로)
-       3차) 잠깐 쉬고 한 번 더. 그래도 안 되면 실패 순간의 화면을 holder['fail_shot']에 남김"""
+       3차) 잠깐 쉬고 한 번 더. 그래도 안 되면 실패 순간의 화면을 holder['fail_shot']에 남김
+       단, 확실한 접속 제한(403/429, 차단 문구)은 재시도 없이 바로 Blocked로 올려보낸다.
+       '빈 화면'처럼 불확실한 경우만 3차까지 재시도한 뒤 차단으로 본다."""
     last = None
     for attempt in (1, 2, 3):
         try:
@@ -410,6 +422,10 @@ def one_check(browser, holder):
         except Blocked as e:
             holder["fail_shot"] = snap(holder["page"], full_page=False)
             holder["fail_stage"] = STAGE
+            if e.soft and attempt < 3:
+                last = e
+                print(f"empty page (try {attempt}, 단계: {STAGE}):", e)
+                continue
             raise
         except Exception as e:
             last = e
@@ -448,9 +464,9 @@ def on_success(enabled, status, img, streak):
     if STATE.get("problem"):
         notify(f"✅ [{t}] 다시 정상적으로 확인되고 있어요 | 날짜: {status}")
         set_state(problem=False)
-    set_state(last_ok=now)
+    set_state(last_ok=now, block_exits=0)
 
-    # 기준일 이후 열린 날짜 (한 번 알린 날짜는 다시 안 알림)
+    # 기준일 이후 열린 날짜 (한 번 알린 날짜는 다시 안 알림. 서버 A/B는 각자 따로 알려서 2번 올 수 있음)
     notified = set(STATE.get("notified", []))
     hit = [d for d in enabled if d >= CUTOFF and d.isoformat() not in notified]
     if hit:
@@ -500,9 +516,22 @@ def gap_watch():
         set_state(last_gap_notice=now)
 
 
+def sleep_until_slot():
+    """다음 확인 시각까지 대기. 시각을 시계에 맞춰서(A: 0초, B: 간격의 절반) 두 서버가 항상 엇갈리게 한다.
+    재시작이 있어도 엇갈림이 유지된다."""
+    now = time.time()
+    phase = (now - SLOT_OFFSET) % INTERVAL
+    nxt = now - phase + INTERVAL
+    time.sleep(max(1, nxt - now))
+
+
 def main():
+    if not WEBHOOK:
+        print("DISCORD_WEBHOOK_URL 환경변수(GitHub Secret)가 없습니다. 디스코드 웹훅 주소를 등록해 주세요.")
+        sys.exit(1)
     if SEND_START:
-        notify(f"✅ CGV 모니터링 시작: '{KEYWORD}' / {THEATER} / {CUTOFF} 이후 날짜 감시 ({INTERVAL // 60}분 간격)")
+        notify(f"✅ CGV 모니터링 시작: '{KEYWORD}' / {THEATER} / {CUTOFF} 이후 날짜 감시 "
+               f"({INTERVAL // 60}분 간격{', 서버 ' + WORKER.upper() if WORKER else ''})")
     if "last_ok" not in STATE:
         set_state(last_ok=time.time())
     blocked_streak, streak, give_up = 0, 0, False
@@ -512,7 +541,7 @@ def main():
         holder = {}
         reset_browser(browser, holder)
         while time.time() < end and not give_up:
-            t0, wait = time.time(), INTERVAL
+            t0, pause = time.time(), None
             holder["fail_shot"] = None
             try:
                 enabled, status, img = one_check(browser, holder)
@@ -523,12 +552,15 @@ def main():
                 streak = 0
                 blocked_streak += 1
                 print("blocked:", e)
-                alert_problem("🚫 CGV가 접속을 막았어요", str(e), holder)
                 if ON_GITHUB:
-                    wait = 20
-                    give_up = blocked_streak >= MAX_BLOCKED   # 종료하면 워크플로가 새 서버로 재시작
+                    set_state(block_exits=STATE.get("block_exits", 0) + 1)
+                    give_up = blocked_streak >= MAX_BLOCKED   # 종료하면 워크플로가 새 서버(새 IP)로 재시작
+                    alert_problem("🚫 CGV가 접속을 막았어요" + (" → 새 서버로 바로 갈아탑니다" if give_up else ""),
+                                  str(e), holder)
+                    pause = 20
                 else:
-                    wait = 600
+                    alert_problem("🚫 CGV가 접속을 막았어요", str(e), holder)
+                    pause = 600
                 gap_watch()
             except Exception as e:
                 streak = 0
@@ -538,7 +570,10 @@ def main():
             print(f"  이번 확인 소요 {time.time() - t0:.1f}초")
             if give_up:
                 break
-            time.sleep(max(1, wait - (time.time() - t0)))
+            if pause:
+                time.sleep(pause)
+            else:
+                sleep_until_slot()
         for k in ("page", "ctx"):
             try:
                 holder[k].close()
@@ -546,7 +581,9 @@ def main():
                 pass
         browser.close()
     if give_up:
-        time.sleep(BLOCK_COOLDOWN)
+        # 첫 차단은 대기 없이 바로 재시작. 차단→재시작이 연속될 때만 조금씩 쉬어서 CGV를 계속 두드리지 않게 함
+        n = STATE.get("block_exits", 1)
+        time.sleep(min(BLOCK_BACKOFF * max(0, n - 1), 120))
 
 
 if __name__ == "__main__":
