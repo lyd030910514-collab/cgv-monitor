@@ -72,9 +72,18 @@ jobs:
           path: ~/.cache/ms-playwright
           key: pw-${{ runner.os }}-${{ hashFiles('requirements.txt') }}
 
-      - run: |
+      # 브라우저: 러너에 이미 깔려 있는 Chrome을 쓰면 몇 초면 끝납니다 (apt 다운로드가 멈추는 일이 없음).
+      # Chrome이 없을 때만 예전처럼 직접 설치하고, 8분 넘게 걸리면 중단해서 새 서버로 다시 시작합니다.
+      - name: Prepare browser
+        timeout-minutes: 8
+        run: |
           pip install -r requirements.txt
-          playwright install --with-deps chromium
+          if [ -x /usr/bin/google-chrome ] || [ -x /opt/google/chrome/chrome ]; then
+            echo "BROWSER_CHANNEL=chrome" >> "$GITHUB_ENV"
+            echo "러너의 Chrome을 사용합니다"
+          else
+            playwright install --with-deps chromium
+          fi
 
       - run: python monitor.py
         env:
