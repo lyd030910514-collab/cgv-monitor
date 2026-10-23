@@ -4,11 +4,13 @@ CGV 예매 오픈 감시 봇 v4 — 매 확인마다 디스코드에 무조건 �
 - 확인할 때마다(기본 3분) 성공이든 차단이든 오류든 디스코드에 메시지가 옵니다.
 - 로그가 바로바로 Actions 화면에 찍힙니다 (이전엔 로그가 통째로 비어 보이는 문제가 있었어요).
 - 웹훅이 죽었으면 시작하자마자 로그에 크게 표시하고, 시작 중에 죽으면 💥 메시지를 보냅니다.
-- (v3 유지) 서버 A/B 동시 감시, 차단 시 즉시 갈아타기, 프록시 전환, 날짜 줄 스크린샷
+- (v3 유지) 서버 동시 감시, 차단 시 즉시 갈아타기, 프록시 전환, 날짜 줄 스크린샷
+- (v5) 서버 A·B·C는 직접 접속, 서버 D는 무료 한국 프록시 목록에서 CGV가 열리는 것을 찾아 그걸로 접속 (실험용)
 """
 import os, re, sys, json, time, random, datetime as dt
 from urllib.parse import urlparse, unquote
 import requests
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from playwright.sync_api import sync_playwright
 
 try:   # 출력을 줄 단위로 바로 내보냄 (Actions 로그가 비어 보이지 않도록)
@@ -28,7 +30,7 @@ THEATER = os.getenv("THEATER", "홍대")
 CUTOFF = dt.date.fromisoformat(os.getenv("CUTOFF_DATE", "2026-10-30"))   # 이 날짜 '이후(당일 포함)'
 LOOP_MINUTES = int(os.getenv("LOOP_MINUTES", "330"))
 INTERVAL = int(os.getenv("INTERVAL_SEC", "180"))          # 서버 1대의 확인 간격(초)
-SLOT_OFFSET = {"b": INTERVAL // 2, "pc": INTERVAL // 4}.get(WORKER, 0)   # B는 A와 반 박자, PC는 1/4 박자 엇갈리게
+SLOT_OFFSET = {"a": 0, "b": INTERVAL // 4, "c": INTERVAL // 2, "d": INTERVAL * 3 // 4, "pc": INTERVAL // 8}.get(WORKER, 0)   # 서버끼리 1/4 박자씩 엇갈리게 (180초면 0/45/90/135초)
 SEND_START = os.getenv("SEND_START_MESSAGE", "false") == "true"
 HEARTBEAT_EVERY = int(os.getenv("HEARTBEAT_EVERY", "10"))  # 연속 N번 성공마다 정상 알림. 0이면 끔
 GAP_ALERT_MIN = int(os.getenv("GAP_ALERT_MIN", "60"))      # 이 시간 넘게 확인 못 하면 알림
@@ -58,7 +60,22 @@ def _proxy_conf(url):
         return None
 
 
-PROXY_CONF = _proxy_conf(PROXY_URL)
+PROXY_FREE = (os.getenv("PROXY_MODE") or "").strip().lower() == "free"   # 서버 D: 무료 프록시를 찾아서 사용
+PROXY_CONF = None if PROXY_FREE else _proxy_conf(PROXY_URL)               # D는 유료 프록시 설정을 쓰지 않음
+PROXY_TRIES = int(os.getenv("PROXY_TRIES", "5"))                          # 한 번 확인할 때 프록시를 최대 몇 개까지 바꿔 볼지
+PROXY_SEARCH_SEC = int(os.getenv("PROXY_SEARCH_SEC", "90"))               # 프록시 후보를 시험하는 제한 시간(초)
+PROXY_ALLOW_ANY = os.getenv("PROXY_ALLOW_ANY", "false") == "true"         # 한국 목록에서 못 찾으면 전 세계 목록도 시험할지
+PROXY_LIST_URLS = [u.strip() for u in os.getenv("PROXY_LIST_URLS", ",".join([
+    "https://raw.githubusercontent.com/proxifly/free-proxy-list/main/proxies/countries/KR/data.txt",
+    "https://api.proxyscrape.com/v2/?request=displayproxies&protocol=http&country=KR&timeout=8000&ssl=all&anonymity=all",
+])).split(",") if u.strip()]
+PROXY_LIST_URLS_ANY = [u.strip() for u in os.getenv("PROXY_LIST_URLS_ANY", ",".join([
+    "https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/http.txt",
+    "https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/http.txt",
+])).split(",") if u.strip()]
+NAV_TIMEOUT = 25000 if PROXY_FREE else 45000                              # 프록시는 느리거나 죽은 경우가 많아서 일찍 포기
+PROXY_NOW = ""                                                            # 지금 쓰는 프록시 (메시지에 표시)
+BAD_PROXIES = set()                                                       # 이번 실행에서 안 된 프록시
 STATE_FILE = "state.json"
 KST = dt.timezone(dt.timedelta(hours=9))
 BLOCK_RE = re.compile(r"비정상|제한되었|접속이 제한|access denied|forbidden|Reference #", re.I)
@@ -72,6 +89,10 @@ class Blocked(Exception):
     def __init__(self, msg="", soft=False):
         super().__init__(msg)
         self.soft = soft
+
+
+class NoProxy(Exception):
+    """통과하는 무료 프록시를 하나도 못 찾은 경우 (서버 D)"""
 
 
 class Changed(Exception):
@@ -113,7 +134,8 @@ def set_state(**kw):
 # ───────── 디스코드 (모든 메시지 앞에 [A]/[B]와 보낸 시각(초 포함) 표시) ─────────
 def stamp(msg):
     """메시지 앞에 '[A] 17:41:23 ' 형태로 서버와 시각(한국 시간)을 붙인다"""
-    return f"{TAG}{dt.datetime.now(KST).strftime('%H:%M:%S')} {msg}"
+    via = f"🛡️{PROXY_NOW} " if PROXY_NOW else ""
+    return f"{TAG}{dt.datetime.now(KST).strftime('%H:%M:%S')} {via}{msg}"
 
 
 def _log_fail(what, r):
@@ -339,12 +361,124 @@ def snap(page, **kw):
         return None
 
 
+# ───────── 서버 D: 무료 한국 프록시 찾기 ─────────
+_HTML_BLOCK_RE = re.compile(r"비정상적으로|이용이 제한|access denied", re.I)
+
+
+def _fetch_list(urls):
+    """프록시 목록 주소들에서 ip:port만 뽑는다 (socks 종류는 제외)"""
+    found = []
+    for u in urls:
+        try:
+            r = requests.get(u, timeout=15)
+            if not r.ok:
+                print(f"프록시 목록 실패 HTTP {r.status_code}: {u[:70]}")
+                continue
+            n0 = len(found)
+            for line in r.text.splitlines():
+                line = line.strip().lower()
+                if line.startswith(("socks4", "socks5")):
+                    continue
+                m = re.search(r"(\d{1,3}(?:\.\d{1,3}){3}):(\d{2,5})", line)
+                if m:
+                    found.append(f"{m.group(1)}:{m.group(2)}")
+            print(f"프록시 목록 {len(found) - n0}개: {u[:70]}")
+        except Exception as e:
+            print("프록시 목록 오류:", str(e)[:80], "|", u[:70])
+    return found
+
+
+def _test_proxy(addr):
+    """이 프록시로 CGV 메인이 정상으로 열리는지 가볍게 시험 (브라우저는 안 씀)"""
+    px = f"http://{addr}"
+    try:
+        r = requests.get(BASE + "/", proxies={"http": px, "https": px}, timeout=8,
+                         headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                                                "(KHTML, like Gecko) Chrome/124.0 Safari/537.36",
+                                  "Accept-Language": "ko-KR,ko;q=0.9"})
+        if r.status_code != 200 or len(r.text) < 2000 or _HTML_BLOCK_RE.search(r.text[:4000]):
+            return None
+        return addr
+    except Exception:
+        return None
+
+
+def find_working_proxies():
+    """(통과한 프록시 목록, 시험한 후보 수)"""
+    tiers = [PROXY_LIST_URLS] + ([PROXY_LIST_URLS_ANY] if PROXY_ALLOW_ANY else [])
+    tested = 0
+    for urls in tiers:
+        cands = [c for c in dict.fromkeys(_fetch_list(urls)) if c not in BAD_PROXIES]
+        random.shuffle(cands)
+        cands = cands[:400]
+        tested += len(cands)
+        print(f"프록시 후보 {len(cands)}개를 시험합니다 (최대 {PROXY_SEARCH_SEC}초)")
+        good = []
+        ex = ThreadPoolExecutor(max_workers=60)
+        futs = [ex.submit(_test_proxy, c) for c in cands]
+        try:
+            for f in as_completed(futs, timeout=PROXY_SEARCH_SEC):
+                r = f.result()
+                if r:
+                    good.append(r)
+                    if len(good) >= 6:
+                        break
+        except Exception:
+            pass   # 제한 시간 끝
+        ex.shutdown(wait=False, cancel_futures=True)
+        print(f"통과한 프록시 {len(good)}개: {good}")
+        if good:
+            return good, tested
+    return [], tested
+
+
+def ensure_free_proxy(holder):
+    """쓸 프록시가 없으면 찾고, 그 프록시로 브라우저를 새로 켠다. 하나도 없으면 None"""
+    global PROXY_NOW
+    if holder.get("proxy"):
+        return holder["proxy"]
+    if not holder["queue"]:
+        stage("무료 프록시 찾기")
+        holder["queue"], holder["tested"] = find_working_proxies()
+    if not holder["queue"]:
+        PROXY_NOW = ""
+        return None
+    proxy = holder["queue"].pop(0)
+    try:
+        holder["browser"].close()
+    except Exception:
+        pass
+    holder["browser"] = launch_browser(holder["pw"], {"server": f"http://{proxy}"})
+    reset_browser(holder["browser"], holder)
+    holder["proxy"] = proxy
+    PROXY_NOW = proxy
+    print("프록시 사용:", proxy)
+    return proxy
+
+
+def one_check_free(holder):
+    """서버 D의 확인 1회: 프록시가 안 되면 다음 프록시로 바꿔 가며 최대 PROXY_TRIES번"""
+    last = None
+    for _ in range(PROXY_TRIES):
+        proxy = ensure_free_proxy(holder)
+        if not proxy:
+            raise NoProxy(f"통과하는 무료 한국 프록시를 못 찾았어요 (후보 {holder.get('tested', 0)}개 시험)")
+        try:
+            return one_check(holder["browser"], holder, attempts=(1,))
+        except Exception as e:
+            last = e
+            print(f"프록시 {proxy} 실패 → 다음 후보로: {str(e)[:100]}")
+            BAD_PROXIES.add(proxy)
+            holder["proxy"] = None
+    raise last
+
+
 # ───────── 예매 화면 열기 ─────────
 def enter_search_like_human(page):
     """사람처럼: 메인 페이지 → 잠깐 머무름 → 검색 화면으로 이동.
     단계 이름이 달라서, 어디서 막히는지(메인부터 막힘 / 검색에서만 막힘) 메시지만 봐도 알 수 있다."""
     stage("메인 페이지 접속")
-    resp = page.goto(BASE, wait_until="domcontentloaded", timeout=45000)
+    resp = page.goto(BASE, wait_until="domcontentloaded", timeout=NAV_TIMEOUT)
     if resp is not None and resp.status in (403, 429):
         raise Blocked(f"메인 페이지부터 HTTP {resp.status}")
     page.wait_for_timeout(1000)   # 화면이 그려질 시간 (아직 비어 있어도 빈 화면으로 오해하지 않도록 차단 문구만 확인)
@@ -372,7 +506,7 @@ def enter_search_like_human(page):
         except Exception:
             continue
     # 2) 못 찾으면 주소로 이동하되, 메인에서 온 것처럼 이전 페이지(referer)를 알려줌
-    resp = page.goto(f"{BASE}/tme/itgrSrch", wait_until="domcontentloaded", timeout=45000, referer=BASE)
+    resp = page.goto(f"{BASE}/tme/itgrSrch", wait_until="domcontentloaded", timeout=NAV_TIMEOUT, referer=BASE)
     if resp is not None and resp.status in (403, 429):
         raise Blocked(f"검색 페이지에서 HTTP {resp.status} (메인은 통과)")
 
@@ -383,7 +517,7 @@ def open_via_search(page):
         enter_search_like_human(page)
     else:
         stage("검색 페이지 접속")
-        resp = page.goto(f"{BASE}/tme/itgrSrch", wait_until="domcontentloaded", timeout=45000)
+        resp = page.goto(f"{BASE}/tme/itgrSrch", wait_until="domcontentloaded", timeout=NAV_TIMEOUT)
         if resp is not None and resp.status in (403, 429):
             raise Blocked(f"HTTP {resp.status}")
     box = page.locator("input[placeholder*='검색어'], input[type=search]").first
@@ -524,7 +658,7 @@ def check(page, force_full):
     return read_dates(page)
 
 
-def one_check(browser, holder):
+def one_check(browser, holder, attempts=(1, 2, 3)):
     """확인 1회. 실패하면 단계적으로 다시 시도:
        1차) 열려 있는 페이지로 빠른 확인
        2차) 브라우저를 새로 만들고 처음부터(검색 경로)
@@ -532,7 +666,7 @@ def one_check(browser, holder):
        접속 제한(403/429, 차단 문구)처럼 보여도 새 브라우저로 처음부터 한 번 더 확인해서(약 10초)
        그래도 막히면 그때 Blocked로 올려보낸다. '빈 화면'은 3차까지 재시도한 뒤 차단으로 본다."""
     last = None
-    for attempt in (1, 2, 3):
+    for attempt in attempts:
         try:
             if attempt > 1 or not holder.get("page") or holder["page"].is_closed():
                 reset_browser(holder["browser"], holder)
@@ -665,23 +799,30 @@ def main():
     blocked_streak, streak, give_up = 0, 0, False
     end = time.time() + LOOP_MINUTES * 60
     with sync_playwright() as p:
-        holder = {"pw": p, "proxy_on": False}
-        holder["browser"] = launch_browser(p)
-        reset_browser(holder["browser"], holder)
+        holder = {"pw": p, "proxy_on": False, "queue": [], "proxy": None}
+        if PROXY_FREE:
+            holder["browser"] = None   # 프록시를 찾은 뒤에 브라우저를 켠다
+        else:
+            holder["browser"] = launch_browser(p)
+            reset_browser(holder["browser"], holder)
         print("브라우저 준비 완료 — 첫 확인을 시작합니다")
         while time.time() < end and not give_up:
             t0, pause = time.time(), None
             holder["fail_shot"] = None
             try:
-                enabled, status, img = one_check(holder["browser"], holder)
+                enabled, status, img = one_check_free(holder) if PROXY_FREE else one_check(holder["browser"], holder)
                 blocked_streak = 0
                 streak += 1
                 on_success(enabled, status, img, streak)
+            except NoProxy as e:
+                streak = 0
+                print("proxy:", e)
+                notify(f"🔎 {e} — 다음 확인 때 다시 찾아볼게요")
             except Blocked as e:
                 streak = 0
                 blocked_streak += 1
                 print("blocked:", e)
-                if ON_GITHUB:
+                if ON_GITHUB and not PROXY_FREE:
                     set_state(block_exits=STATE.get("block_exits", 0) + 1)
                     give_up = blocked_streak >= MAX_BLOCKED   # 종료하면 워크플로가 새 서버(새 IP)로 재시작
                     alert_problem("🚫 CGV가 접속을 막았어요" + (" → 새 서버로 바로 갈아탑니다" if give_up else ""),
@@ -689,7 +830,7 @@ def main():
                     pause = 20
                 else:
                     alert_problem("🚫 CGV가 접속을 막았어요", str(e), holder)
-                    pause = 600
+                    pause = None if PROXY_FREE else 600   # 서버 D는 프록시를 바꿔 가며 다음 확인 때 다시
                 gap_watch()
             except Exception as e:
                 streak = 0
