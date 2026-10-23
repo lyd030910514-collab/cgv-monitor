@@ -1,1 +1,1 @@
-{"updated": 1792755987, "mode": "proxy", "proxy": "112.169.99.71:8073"}
+{"updated": 1792755990, "mode": "direct", "proxy": "", "released_seq": 3, "bad": ["112.169.99.71:8073"]}
